@@ -22,6 +22,7 @@ from time import time, localtime, strftime
 import datetime
 from ldap3 import Server, Connection, SIMPLE, \
     SYNC, ALL, SASL, NTLM
+from ldap3.core.exceptions import LDAPSocketOpenError
 
 from rom.crypto import generate_subkey, ntlm_hash, RC4_HMAC, HMAC_MD5
 from rom.krb5 import build_as_req, build_tgs_req, send_req, recv_rep, \
@@ -315,8 +316,8 @@ def ldap_get_all_users_spn(AttackParameters, port):
     # Now we should be connected to the DC through LDAP
     try :
         c.open()
-    except :
-        WRITE_STDOUT("ldap connection error: %s\n")
+    except LDAPSocketOpenError as e:
+        WRITE_STDOUT("ldap connection error: %s\n" % e)
         sys.exit(1)
 
     try :
@@ -477,7 +478,7 @@ def parse_arguments():
     group.add_argument('--hash', required=False, help="user's hash key. Format is \"LM:NT\".\
     Cannot be used with '-p'")
 
-    parser.add_argument('-v', '--verbose', required=False, action='store_const', const=1,
+    parser.add_argument('-v', '--verbose', required=False, action='store_true',
     help="increase verbosity level")
 
     parser.add_argument('--delta', required=False,
@@ -494,11 +495,12 @@ def parse_arguments():
     group2.add_argument('-s', '--sam_account_name', required=False, help="retrieve\
     the SPN of the provided sAMAccountName.")
 
+    options = parser.parse_args()
+
     if options.computers and not options.list_spn_only:
         parser.print_help()
         sys.exit(1)
 
-    options = parser.parse_args()
     if not any(vars(options).values()):
         parser.print_help()
         sys.exit(1)
@@ -508,6 +510,8 @@ def parse_arguments():
 
 
 def main():
+    global verbose_level
+
     options = parse_arguments()
 
     if options.verbose:

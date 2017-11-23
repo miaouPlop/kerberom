@@ -21,6 +21,7 @@ from pyasn1.type.tag import Tag, tagClassContext, tagClassApplication, tagFormat
 from pyasn1.type.namedtype import NamedTypes, NamedType, OptionalNamedType
 from pyasn1.codec.der.encoder import encode
 from pyasn1.codec.der.decoder import decode
+from pyasn1.error import SubstrateUnderrunError
 
 from crypto import encrypt, decrypt, checksum, RC4_HMAC, RSA_MD5
 from util import epoch2gt
@@ -236,6 +237,28 @@ class KerbPaPacRequest(Sequence):
     componentType = NamedTypes(
         NamedType('include-pac', _c(0, Boolean())))
 
+class KrbError(Sequence):
+    tagSet = application(30)
+    componentType = NamedTypes(
+        NamedType('pvno', _c(0, Integer())),
+        NamedType('msg-type', _c(1, Integer())),
+        OptionalNamedType('ctime', _c(2, KerberosTime())),
+        OptionalNamedType('cusec', _c(3, Microseconds())),
+        NamedType('stime', _c(4, KerberosTime())),
+        NamedType('susec', _c(5, Microseconds())),
+        NamedType('error-code', _c(6, Integer())),
+        OptionalNamedType('crealm', _c(7, Realm())),
+        OptionalNamedType('cname', _c(8, PrincipalName())),
+        NamedType('realm', _c(9, Realm())),
+        NamedType('sname', _c(10, PrincipalName())),
+        OptionalNamedType('e-text', _c(11, KerberosString())),
+        OptionalNamedType('e-data', _c(12, OctetString())))
+
+class KrbErrorData(Sequence):
+    componentType = NamedTypes(
+        NamedType('data-type', _c(1, Integer())),
+        NamedType('data-value', _c(2, OctetString())))
+
 def build_req_body(realm, service, host, nonce, cname=None, authorization_data=None, etype=RC4_HMAC):
     req_body = KdcReqBody()
 
@@ -441,7 +464,24 @@ def _decrypt_rep(data, key, spec, enc_spec, msg_type):
     return rep, rep_enc
 
 def decrypt_tgs_rep(data, key):
-    return _decrypt_rep(data, key, TgsRep(), EncTGSRepPart(), 9) # assume subkey
+    try:
+        packet = decode(data, asn1Spec=KrbError())[0]
+    except:
+        return _decrypt_rep(data, key, TgsRep(), EncTGSRepPart(), 9) # assume subkey
+    else:  # packet contains an error
+        try:
+            error_code = decode(str(packet['e-data']), asn1Spec=KrbErrorData())[0]
+        except SubstrateUnderrunError:
+            err = "An unknown error happend during packet parsing (bad SPN?)"
+        else:
+            nt_error = unpack('<L', str(error_code['data-value'])[:4])[0]
+
+            try:
+                err = "NT ERROR: %s(%s)" % NT_ERROR_MESSAGES[nt_error]
+            except IndexError:
+                err = "An unknown error happend (packet is not a TGS-REP)"
+
+        return "error", err
 
 def _extract_data(data, spec):
     rep = decode(data, asn1Spec=spec)[0]

